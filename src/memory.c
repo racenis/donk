@@ -21,3 +21,7 @@ char* donk_malloc(int bytes) {
 void donk_free(char* memory) {
 	free(memory);
 }
+
+char* donk_realloc(char* memory, int bytes) {
+	return realloc(memory, bytes);
+}

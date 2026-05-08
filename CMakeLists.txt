@@ -26,7 +26,9 @@ FetchContent_MakeAvailable(utest)
 
 enable_testing()
 
-add_executable(test_memory tests/memory.c)
-target_include_directories(test_memory PRIVATE src ${utest_SOURCE_DIR})
-target_link_libraries(test_memory PRIVATE donk)
-add_test(NAME memory COMMAND test_memory)
+foreach(test_name memory array)
+	add_executable(test_${test_name} tests/${test_name}.c)
+	target_include_directories(test_${test_name} PRIVATE src ${utest_SOURCE_DIR})
+	target_link_libraries(test_${test_name} PRIVATE donk)
+	add_test(NAME ${test_name} COMMAND test_${test_name})
+endforeach()

@@ -4,4 +4,6 @@
 char* donk_malloc(int);
 void donk_free(char*);
 
+char* donk_realloc(char*, int);
+
 #endif // DONK_MEMORY_H
