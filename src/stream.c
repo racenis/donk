@@ -1,12 +1,71 @@
 #include "stream.h"
 
-/*
-	TODO: CREATE STREAM INTERFACE
-	
-	It needs to be able to read and write arbitrary data, need functions like
-	read_char() or read_int().
-	
-	TODO: ADD BIT-LEVEL MACROS
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-	Something like read_bits(stream, 3) to read 3 bits off of the stream.
-*/
+void donk_read_bytes(donk_stream_input_t* stream, int count, void* bytes) {
+	stream->read(stream, count, bytes);
+}
+
+void donk_write_bytes(donk_stream_output_t* stream, int count, void* bytes) {
+	stream->write(stream, count, bytes);
+}
+
+static void input_file_read(donk_stream_input_t* stream, int count, void* bytes) {
+	int read = fread(bytes, count, 1, stream->data);
+	if (read != 1) {
+		if (feof(stream->data)) {
+			stream->state = DONK_STREAM_END;
+		} else {
+			stream->state = DONK_STREAM_READ_FAILED;
+		}
+	}
+}
+
+static void input_file_close(donk_stream_input_t* stream) {
+	fclose(stream->data);
+	memset(stream, 0, sizeof(donk_stream_input_t));
+}
+
+void donk_open_input_stream_from_file(donk_stream_input_t* stream, const char* filename) {
+	memset(stream, 0, sizeof(donk_stream_input_t));
+	
+	stream->read = input_file_read;
+	stream->close = input_file_close;
+
+	stream->data = fopen(filename, "rb");
+	if (!stream->data) {
+		stream->state = DONK_STREAM_OPEN_FAILED;
+		return;
+	}
+	
+	stream->state = DONK_STREAM_READY;
+}
+
+static void output_file_write(struct donk_stream_output* stream, int count, void* bytes) {
+	int written = fwrite(bytes, count, 1, stream->data);
+	if (written != 1) {
+		stream->state = DONK_STREAM_WRITE_FAILED;
+	}
+}
+
+static void output_file_close(donk_stream_output_t* stream) {
+	fclose(stream->data);
+	memset(stream, 0, sizeof(donk_stream_output_t));
+}
+
+void donk_open_output_stream_from_file(donk_stream_output_t* stream, const char* filename) {
+	memset(stream, 0, sizeof(donk_stream_output_t));
+	
+	stream->write = output_file_write;
+	stream->close = output_file_close;
+
+	stream->data = fopen(filename, "wb");
+	if (!stream->data) {
+		stream->state = DONK_STREAM_OPEN_FAILED;
+		return;
+	}
+	
+	stream->state = DONK_STREAM_READY;
+}
