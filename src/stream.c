@@ -69,3 +69,11 @@ void donk_open_output_stream_from_file(donk_stream_output_t* stream, const char*
 	
 	stream->state = DONK_STREAM_READY;
 }
+
+void donk_close_input_stream(donk_stream_input_t* stream) {
+	stream->close(stream);
+}
+
+void donk_close_output_stream(donk_stream_output_t* stream) {
+	stream->close(stream);
+}
