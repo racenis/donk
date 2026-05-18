@@ -1,7 +1,10 @@
 #include "container.h"
 
+#include "coding.h"
+
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /*
 	TODO: IMPLEMENT THE CONTAINERS
@@ -102,121 +105,166 @@ void donk_add_channel(donk_encoder_t* encoder, int flags, int index) {
 	donk_write_bytes(encoder->stream, sizeof(header), &header);
 }
 
+static void interlace_coding_block(donk_frame_t* frame, int w, int h,
+						unsigned char* r, unsigned char* g, unsigned char* b)
+{
+	int w_extent = w + 16 > frame->image.width ? frame->image.width : w + 16;
+	int h_extent = h + 16 > frame->image.height ? frame->image.height : h + 16;
+	
+	for (int y = h; y < h_extent; y++)
+	for (int x = w; x < w_extent; x++) {
+		int destination_offset = 3 * (y * frame->image.width + x);
+		int source_offset = (y - h) * 16 + x - w;
+		frame->image.pixels[destination_offset + 0] = r[source_offset];
+		frame->image.pixels[destination_offset + 1] = g[source_offset];
+		frame->image.pixels[destination_offset + 2] = b[source_offset];
+	}
+}
+
+static void deinterlace_coding_block(donk_frame_t* frame, int w, int h,
+						unsigned char* r, unsigned char* g, unsigned char* b)
+{
+	int w_extent = w + 16 > frame->image.width ? frame->image.width : w + 16;
+	int h_extent = h + 16 > frame->image.height ? frame->image.height : h + 16;
+	
+	for (int y = h; y < h_extent; y++)
+	for (int x = w; x < w_extent; x++) {
+		int source_offset = 3 * (y * frame->image.width + x);
+		int destination_offset = (y - h) * 16 + x - w;
+		r[destination_offset] = frame->image.pixels[source_offset + 0];
+		g[destination_offset] = frame->image.pixels[source_offset + 1];
+		b[destination_offset] = frame->image.pixels[source_offset + 2];
+	}
+}
+
+static void encode_wavelet_block(donk_stream_output_t* stream,
+	unsigned char* r, unsigned char* g, unsigned char* b)
+{
+	int luma[256];
+	int cr[256];
+	int cb[256];
+	
+	for (int i = 0; i < 256; i++) {
+		luma[i] = donk_luma_from_rgb((int)r[i], (int)g[i], (int)b[i]);
+		cr[i] = donk_chroma_from_ry((int)r[i], luma[i]);
+		cb[i] = donk_chroma_from_by((int)b[i], luma[i]);
+	}
+	
+	donk_wavelet_transform(luma, 16);
+	donk_wavelet_transform(cr, 16);
+	donk_wavelet_transform(cb, 16);
+	
+	int luma_cutoff_a = donk_wavelet_cutoff(luma, 256, donk_wavelet_pattern_a, 10, 32);
+	int luma_cutoff_b = donk_wavelet_cutoff(luma, 256, donk_wavelet_pattern_b, 10, 32);
+	int luma_cutoff_c = donk_wavelet_cutoff(luma, 256, donk_wavelet_pattern_c, 10, 32);
+	int luma_cutoff_d = donk_wavelet_cutoff(luma, 256, donk_wavelet_pattern_d, 10, 32);
+	
+	unsigned char wavelet_pattern = 0;
+	int luma_cutoff = luma_cutoff_a;
+	if (luma_cutoff_b < luma_cutoff) luma_cutoff = luma_cutoff_b, wavelet_pattern = 1;
+	if (luma_cutoff_c < luma_cutoff) luma_cutoff = luma_cutoff_c, wavelet_pattern = 2;
+	if (luma_cutoff_d < luma_cutoff) luma_cutoff = luma_cutoff_d, wavelet_pattern = 3;
+	
+	int chroma_cutoff_cr = donk_wavelet_cutoff(cr, 256, donk_wavelet_pattern_d, 3, 32);
+	int chroma_cutoff_cb = donk_wavelet_cutoff(cb, 256, donk_wavelet_pattern_d, 3, 32);
+	int chroma_cutoff = chroma_cutoff_cr > chroma_cutoff_cb ? chroma_cutoff_cr : chroma_cutoff_cb;
+	if (chroma_cutoff >= 15) chroma_cutoff = 15;
+	
+	for (int i = 0; i < 256; i++) {
+		if (cr[i] < -128) cr[i] = -128;
+		if (cr[i] > 127) cr[i] = 127;
+		if (cb[i] < -128) cb[i] = -128;
+		if (cb[i] > 127) cb[i] = 127;
+		
+		if (i == 0) continue;
+		
+		if (luma[i] < -128) luma[i] = -128;
+		if (luma[i] > 127) luma[i] = 127;
+	}
+
+	unsigned char packed_luma[256];
+	unsigned char packed_cr[256];
+	unsigned char packed_cb[256];
+	
+	const int* luma_pattern;
+	switch (wavelet_pattern) {
+		case 0: luma_pattern = donk_wavelet_pattern_a;
+		case 1: luma_pattern = donk_wavelet_pattern_b;
+		case 2: luma_pattern = donk_wavelet_pattern_c;
+		case 3: luma_pattern = donk_wavelet_pattern_d;
+	}
+
+	for (int i = 0; i < 256; i++) {
+		packed_luma[i] = luma[luma_pattern[i]];
+		packed_cr[i] = cr[donk_wavelet_pattern_d[i]];
+		packed_cb[i] = cb[donk_wavelet_pattern_d[i]];
+	}
+	
+	unsigned char quantized_luma[256];
+	unsigned char quantized_cr[256];
+	unsigned char quantized_cb[256];
+	
+	int cr_bits = donk_quantize_bits(packed_cr, 256, 7);
+	int cb_bits = donk_quantize_bits(packed_cb, 256, 7);
+	
+	unsigned char luma_bits = donk_quantize_bits(packed_luma, 256, 8);
+	unsigned char chroma_bits = cr_bits > cb_bits ? cr_bits : cb_bits;
+	
+	donk_quantize(packed_luma, luma_cutoff, luma_bits, quantized_luma);
+	donk_quantize(packed_cr, chroma_cutoff, chroma_bits, quantized_cr);
+	donk_quantize(packed_cb, chroma_cutoff, chroma_bits, quantized_cb);
+	int luma_bytes = donk_quantized_bytes(luma_cutoff, luma_bits);
+	int chroma_bytes = donk_quantized_bytes(chroma_cutoff, chroma_bits);
+	
+	unsigned char w_cutoff = luma_cutoff;
+	unsigned char chroma_pack = wavelet_pattern | (((unsigned char)chroma_cutoff) << 2);
+	unsigned char quantization = luma_bits << 4 | chroma_bits;
+	
+	donk_write_bytes(stream, 1, &w_cutoff);
+	donk_write_bytes(stream, 1, &chroma_pack);
+	donk_write_bytes(stream, 1, &quantization);
+	donk_write_bytes(stream, luma_bytes, quantized_luma);
+	
+	donk_write_bytes(stream, chroma_bytes, quantized_cr);
+	donk_write_bytes(stream, chroma_bytes, quantized_cb);
+}
+
 void donk_encode_frame(donk_encoder_t* encoder, donk_frame_t* frame) {
 	// TODO: lookup channel info here
 
+	
+	int horizontal_blocks = (frame->image.width + 15) & ~15;
+	int vertical_blocks = (frame->image.height + 15) & ~15;
+	int wavelet_data_max = horizontal_blocks * vertical_blocks * (3 + 3 * 256);
+	
+	unsigned char* encoded_wavelet_data = malloc(wavelet_data_max);
+	
+	donk_stream_output_t encode_stream;
+	donk_open_output_stream_in_memory(&encode_stream, encoded_wavelet_data, wavelet_data_max);
+	
+	for (int h = 0; h < frame->image.height; h += 16)
+	for (int w = 0; w < frame->image.width; w += 16) {
+		unsigned char r[256];
+		unsigned char g[256];
+		unsigned char b[256];
+		
+		deinterlace_coding_block(frame, w, h, r, g, b);
+		
+		encode_wavelet_block(&encode_stream, r, g, b);
+	}
+	
 	struct image_wavelet_header header;
 	memset(&header, 0, sizeof(header));
 	header.timestamp = frame->timestamp;
 	header.channel = frame->channel;
 	header.width = frame->image.width;
 	header.height = frame->image.height;
-	header.size = frame->image.width * frame->image.height * 3;
+	header.size = encode_stream.cursor;
+	header.actual_size = encode_stream.cursor;
 	donk_write_bytes(encoder->stream, 8, "DONKIMWV");
 	donk_write_bytes(encoder->stream, sizeof(header), &header);
-
-	for (int h = 0; h < header.height; h += 16)
-	for (int w = 0; w < header.width; w += 16) {
-		int w_extent = w + 16 > header.width ? header.width : w + 16;
-		int h_extent = h + 16 > header.height ? header.height : h + 16;
-		
-		int tluma[16 * 16];
-		int tcr[16 * 16];
-		int tcb[16 * 16];
-		
-		for (int y = h; y < h_extent; y++)
-		for (int x = w; x < w_extent; x++) {
-			int source_offset = 3 * (y * header.width + x);
-			int r = frame->image.pixels[source_offset + 0];
-			int g = frame->image.pixels[source_offset + 1];
-			int b = frame->image.pixels[source_offset + 2];
-			
-			int luma = donk_luma_from_rgb(r, g, b);
-			int cr = donk_chroma_from_ry(r, luma);
-			int cb = donk_chroma_from_by(b, luma);
-			
-			int destination_offset = (y - h) * 16 + x - w;
-			tluma[destination_offset] = luma;
-			tcr[destination_offset] = cr;
-			tcb[destination_offset] = cb;
-		}
-		
-		donk_wavelet_transform(tluma, 16);
-		donk_wavelet_transform(tcr, 16);
-		donk_wavelet_transform(tcb, 16);
-		
-		
-		int luma_cutoff_a = donk_wavelet_cutoff(tluma, 256, donk_wavelet_pattern_a, 12, 32);
-		int luma_cutoff_b = donk_wavelet_cutoff(tluma, 256, donk_wavelet_pattern_b, 12, 32);
-		int luma_cutoff_c = donk_wavelet_cutoff(tluma, 256, donk_wavelet_pattern_c, 12, 32);
-		int luma_cutoff_d = donk_wavelet_cutoff(tluma, 256, donk_wavelet_pattern_d, 12, 32);
-		unsigned char wavelet_pattern = 0;
-		int luma_cutoff = luma_cutoff_a;
-		if (luma_cutoff_b < luma_cutoff) luma_cutoff = luma_cutoff_b, wavelet_pattern = 1;
-		if (luma_cutoff_c < luma_cutoff) luma_cutoff = luma_cutoff_c, wavelet_pattern = 2;
-		if (luma_cutoff_d < luma_cutoff) luma_cutoff = luma_cutoff_d, wavelet_pattern = 3;
-		
-		int chroma_cutoff_cr = donk_wavelet_cutoff(tcr, 256, donk_wavelet_pattern_d, 12, 32);
-		int chroma_cutoff_cb = donk_wavelet_cutoff(tcb, 256, donk_wavelet_pattern_d, 12, 32);
-		int chroma_cutoff = chroma_cutoff_cr > chroma_cutoff_cb ? chroma_cutoff_cr : chroma_cutoff_cb;
-		if (chroma_cutoff >= 15) chroma_cutoff = 15;
-		
-		for (int i = 0; i < 256; i++) {
-			if (tcr[i] < -128) tcr[i] = -128;
-			if (tcr[i] > 127) tcr[i] = 127;
-			if (tcb[i] < -128) tcb[i] = -128;
-			if (tcb[i] > 127) tcb[i] = 127;
-			
-			if (i == 0) continue;
-			
-			if (tluma[i] < -128) tluma[i] = -128;
-			if (tluma[i] > 127) tluma[i] = 127;
-		}
-
-		unsigned char packed_luma[256];
-		unsigned char packed_cr[256];
-		unsigned char packed_cb[256];
-		
-		const int* luma_pattern;
-		switch (wavelet_pattern) {
-			case 0: luma_pattern = donk_wavelet_pattern_a;
-			case 1: luma_pattern = donk_wavelet_pattern_b;
-			case 2: luma_pattern = donk_wavelet_pattern_c;
-			case 3: luma_pattern = donk_wavelet_pattern_d;
-		}
-
-		for (int i = 0; i < 256; i++) {
-			packed_luma[i] = tluma[luma_pattern[i]];
-			packed_cr[i] = tcr[donk_wavelet_pattern_d[i]];
-			packed_cb[i] = tcb[donk_wavelet_pattern_d[i]];
-		}
-		
-		unsigned char quantized_luma[256];
-		unsigned char quantized_cr[256];
-		unsigned char quantized_cb[256];
-		
-		unsigned char luma_bits = 6;
-		unsigned char chroma_bits = 6;
-		
-		
-		donk_quantize(packed_luma, luma_cutoff, luma_bits, quantized_luma);
-		donk_quantize(packed_cr, chroma_cutoff, chroma_bits, quantized_cr);
-		donk_quantize(packed_cb, chroma_cutoff, chroma_bits, quantized_cb);
-		int luma_bytes = donk_quantized_bytes(luma_cutoff, luma_bits);
-		int chroma_bytes = donk_quantized_bytes(chroma_cutoff, chroma_bits);
-		
-		unsigned char w_cutoff = luma_cutoff;
-		unsigned char chroma_pack = wavelet_pattern | (((unsigned char)chroma_cutoff) << 2);
-		unsigned char quantization = luma_bits << 4 | chroma_bits;
-		
-		donk_write_bytes(encoder->stream, 1, &w_cutoff);
-		donk_write_bytes(encoder->stream, 1, &chroma_pack);
-		donk_write_bytes(encoder->stream, 1, &quantization);
-		donk_write_bytes(encoder->stream, luma_bytes, quantized_luma);
-		
-		donk_write_bytes(encoder->stream, chroma_bytes, quantized_cr);
-		donk_write_bytes(encoder->stream, chroma_bytes, quantized_cb);
-	}
+	
+	donk_write_bytes(encoder->stream, encode_stream.cursor, encoded_wavelet_data);
 }
 
 
@@ -265,10 +313,10 @@ static void decode_wavelet_image(donk_decoder_t* decoder, donk_frame_t* frame) {
 	
 	int horizontal_blocks = (header.width >> 4) << 4 == header.width 
 		? header.width : ((header.width >> 4) + 1) << 4;
-	int vertical_blocks = (header.width >> 4) << 4 == header.width 
-		? header.width : ((header.width >> 4) + 1) << 4;
-	for (int h = 0; h < horizontal_blocks; h += 16)
-	for (int w = 0; w < vertical_blocks; w += 16) {
+	int vertical_blocks = (header.height >> 4) << 4 == header.height 
+		? header.height : ((header.height >> 4) + 1) << 4;
+	for (int h = 0; h < vertical_blocks; h += 16)
+	for (int w = 0; w < horizontal_blocks; w += 16) {
 		unsigned char quantized_luma[256];
 		unsigned char quantized_cr[256];
 		unsigned char quantized_cb[256];
@@ -287,7 +335,6 @@ static void decode_wavelet_image(donk_decoder_t* decoder, donk_frame_t* frame) {
 		donk_read_bytes(decoder->stream, 1, &lumas);
 		donk_read_bytes(decoder->stream, 1, &chroma_pack);
 		donk_read_bytes(decoder->stream, 1, &quantization);
-		
 		
 		unsigned char chromas = chroma_pack >> 2;
 		unsigned char wavelet_pattern = 0x03 & chroma_pack;
@@ -313,56 +360,56 @@ static void decode_wavelet_image(donk_decoder_t* decoder, donk_frame_t* frame) {
 		donk_dequantize(packed_cr, chromas, chroma_bits, quantized_cr);
 		donk_dequantize(packed_cb, chromas, chroma_bits, quantized_cb);
 		
-		int tluma[16 * 16];
-		int tcr[16 * 16];
-		int tcb[16 * 16];
+		int luma[256];
+		int cr[256];
+		int cb[256];
 		
-		memset(tluma, 0, 16 * 16 * 4);
-		memset(tcr, 0, 16 * 16 * 4);
-		memset(tcb, 0, 16 * 16 * 4);
+		memset(luma, 0, 1024);
+		memset(cr, 0, 1024);
+		memset(cb, 0, 1024);
 		
-		tluma[0] = (unsigned char)packed_luma[0];
-		tcr[0] = packed_cr[0];
-		tcb[0] = packed_cb[0];
+		luma[0] = (unsigned char)packed_luma[0];
+		cr[0] = packed_cr[0];
+		cb[0] = packed_cb[0];
 		
 		for (int i = 1; i < 256; i++) {
-			tluma[luma_pattern[i]] = packed_luma[i];
-			tcr[donk_wavelet_pattern_d[i]] = packed_cr[i];
-			tcb[donk_wavelet_pattern_d[i]] = packed_cb[i];
+			luma[luma_pattern[i]] = packed_luma[i];
+			cr[donk_wavelet_pattern_d[i]] = packed_cr[i];
+			cb[donk_wavelet_pattern_d[i]] = packed_cb[i];
 		}
 		
-		donk_inv_wavelet_transform(tluma, 16);
-		donk_inv_wavelet_transform(tcr, 16);
-		donk_inv_wavelet_transform(tcb, 16);
+		donk_inv_wavelet_transform(luma, 16);
+		donk_inv_wavelet_transform(cr, 16);
+		donk_inv_wavelet_transform(cb, 16);
 		
-		int w_extent = w + 16 > header.width ? header.width : w + 16;
-		int h_extent = h + 16 > header.height ? header.height : h + 16;
+		unsigned char r_deint[256];
+		unsigned char g_deint[256];
+		unsigned char b_deint[256];
 		
-		for (int y = h; y < h_extent; y++)
-		for (int x = w; x < w_extent; x++) {
-			int destination_offset = (y - h) * 16 + x - w;
-			int luma = tluma[destination_offset];
-			int cr = tcr[destination_offset];
-			int cb = tcb[destination_offset];
+		for (int i = 0; i < 256; i++) {
+			int luma_val = luma[i];
+			int cr_val = cr[i];
+			int cb_val = cb[i];
 			
-			int r = donk_r_from_ycrcb(cr, cb, luma);
-			int b = donk_b_from_ycrcb(cr, cb, luma);
+			int r = donk_r_from_ycrcb(cr_val, cb_val, luma_val);
+			int b = donk_b_from_ycrcb(cr_val, cb_val, luma_val);
 
 			if (r < 0) r = 0;
 			if (r > 255) r = 255;
 			if (b < 0) b = 0;
 			if (b > 255) b = 255;
 			
-			int g = donk_g_from_yrb(r, b, luma);
+			int g = donk_g_from_yrb(r, b, luma_val);
 			
 			if (g < 0) g = 0;
 			if (g > 255) g = 255;
 			
-			int source_offset = 3 * (y * header.width + x);
-			frame->image.pixels[source_offset + 0] = r;
-			frame->image.pixels[source_offset + 1] = g;
-			frame->image.pixels[source_offset + 2] = b;
-		}	
+			r_deint[i] = r;
+			g_deint[i] = g;
+			b_deint[i] = b;
+		}
+		
+		interlace_coding_block(frame, w, h, r_deint, g_deint, b_deint);
 	}
 	
 	printf("done decoding image\n");
