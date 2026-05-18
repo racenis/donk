@@ -1,5 +1,8 @@
 #include "coding.h"
 
+#include <stdlib.h>
+#include <string.h>
+
 /*
 	TODO: IMPLEMENT HUFFMAN CODING
 	
@@ -133,8 +136,9 @@ int donk_wavelet_cutoff(int* array, int size, const int* lut, int quality, int t
 void donk_quantize(unsigned char* unpacked, int size, int bits, unsigned char* packed) {
 	memset(packed, 0, size);
 	int inv_bits = 8 - bits;
-	int bits_packed = 0;
-	for (int i = 0; i < size; i++) {
+	int bits_packed = 8;
+	packed[0] = unpacked[0];
+	for (int i = 1; i < size; i++) {
 		unsigned char value = unpacked[i] >> inv_bits;
 		int byte = bits_packed >> 3;
 		int bit_in_byte = bits_packed - (byte << 3);
@@ -151,8 +155,9 @@ void donk_quantize(unsigned char* unpacked, int size, int bits, unsigned char* p
 
 void donk_dequantize(unsigned char* unpacked, int size, int bits, unsigned char* packed) {
 	int inv_bits = 8 - bits;
-	int bits_unpacked = 0;
-	for (int i = 0; i < size; i++) {
+	int bits_unpacked = 8;
+	unpacked[0] = packed[0];
+	for (int i = 1; i < size; i++) {
 		int byte = bits_unpacked >> 3;
 		int bit_in_byte = bits_unpacked - (byte << 3);
 		int bits_left = 8 - bit_in_byte;
@@ -169,7 +174,36 @@ void donk_dequantize(unsigned char* unpacked, int size, int bits, unsigned char*
 }
 
 int donk_quantized_bytes(int size, int bits) {
-	return ((size) * (bits) + 7) / 8;
+	return 1 + ((size-1) * (bits) + 7) / 8;
+}
+
+static const int acceptable_error[16] = {
+	1024, 896, 832, 768,
+	704, 640, 576, 512,
+	384, 256, 192, 128,
+	96, 64, 32, 0
+};
+
+int donk_quantize_bits(unsigned char* array, int size, int quality) {
+	if (--quality > 15) quality = 15;
+	if (quality < 0) quality = 0;
+	
+	const int threshold = acceptable_error[quality];
+	int error = 0;
+	
+	for (int b = 0; b < 7; b++) {
+		for (int i = 0; i < size; i++) {
+			if (array[i] & (1 << b)) error += 1 << b;
+		}
+		
+		if (error > threshold) {
+			//printf("b %i e %i; ", b, error);
+			return 8 - b;
+		}
+	}
+	
+	//printf("b %i e %i; ", 1, error);
+	return 1;
 }
 
 const int donk_wavelet_pattern_a[256] = {
