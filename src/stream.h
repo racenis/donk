@@ -36,6 +36,9 @@ void donk_write_bytes(donk_stream_output_t* stream, int count, void* bytes);
 void donk_open_input_stream_from_file(donk_stream_input_t* stream, const char* filename);
 void donk_open_output_stream_from_file(donk_stream_output_t* stream, const char* filename);
 
+void donk_open_input_stream_in_memory(donk_stream_input_t* stream, void* data, int size);
+void donk_open_output_stream_in_memory(donk_stream_output_t* stream, void* data, int size);
+
 void donk_close_input_stream(donk_stream_input_t* stream);
 void donk_close_output_stream(donk_stream_output_t* stream);
 
