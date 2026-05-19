@@ -66,6 +66,22 @@ void donk_palette_add_color(donk_palette_t* palette, unsigned char r, unsigned c
 	palette->stats[key]++;
 }
 
+static unsigned int color_dist(unsigned short key, unsigned char r, unsigned char g, unsigned char b) {
+	const int kr = donk_key_to_r(key);
+	const int kg = donk_key_to_g(key);
+	const int kb = donk_key_to_b(key);
+	
+	int r_dif = kr - (int)r;
+	int g_dif = kg - (int)g;
+	int b_dif = kb - (int)b;
+
+	if (r_dif < 0) r_dif = -r_dif;
+	if (g_dif < 0) g_dif = -g_dif;
+	if (b_dif < 0) b_dif = -b_dif;
+
+	return r_dif + g_dif + b_dif;
+}
+
 void donk_palette_build(donk_palette_t* palette) {
 	struct {
 		unsigned char r; unsigned char g; unsigned char b;
@@ -75,10 +91,12 @@ void donk_palette_build(donk_palette_t* palette) {
 	
 	// init random colors
 	for (int i = 0; i < 256; i++) {
-		short color = i * 256; // pick arbitrary color
+		unsigned short color = i * 256; // pick arbitrary color
 		
 		// find next color that is in set
-		while (!palette->stats[color]) color++;
+		while (!palette->stats[color]) {
+			color++;
+		}
 		
 		clusters[i].r = donk_key_to_r(color);
 		clusters[i].g = donk_key_to_g(color);
@@ -136,22 +154,32 @@ void donk_palette_build(donk_palette_t* palette) {
 	for (int i = 0; i < 256; i++) {
 		palette->colors[i] = donk_color_to_key(clusters[i].r, clusters[i].g, clusters[i].b);
 	}
-}
-
-static unsigned int color_dist(unsigned short key, unsigned char r, unsigned char g, unsigned char b) {
-	const int kr = donk_key_to_r(key);
-	const int kg = donk_key_to_g(key);
-	const int kb = donk_key_to_b(key);
 	
-	int r_dif = kr - (int)r;
-	int g_dif = kg - (int)g;
-	int b_dif = kb - (int)b;
+	// create a LUT for RGB -> palette color mapping
+	palette->palette_lut = malloc(65536);
+	
+	for (int c = 0; c < 65536; c++) {
+		int best_distance = INT_MAX;
+		int best_color = 0;
 
-	if (r_dif < 0) r_dif = -r_dif;
-	if (g_dif < 0) g_dif = -g_dif;
-	if (b_dif < 0) b_dif = -b_dif;
-
-	return r_dif + g_dif + b_dif;
+		for (int p = 0; p < 256; p++) {
+			const int r = donk_key_to_r(c);
+			const int g = donk_key_to_g(c);
+			const int b = donk_key_to_b(c);
+			
+			unsigned int dist = color_dist(palette->colors[p], r, g, b);
+			
+			if (dist < best_distance) {
+				best_distance = dist;
+				best_color = p;
+			}
+		}
+		
+		// note that we use a quantized 16-bit key for the lookup table. using a
+		// 24-bit key generally generates (subjectively) slightly better
+		// subpalettes, but that table would use up a lot more memory
+		palette->palette_lut[c] = best_color;
+	}	
 }
 
 void donk_palette_add_block(donk_palette_t* palette, unsigned char* r, unsigned char* g, unsigned char* b) {
@@ -160,19 +188,8 @@ void donk_palette_add_block(donk_palette_t* palette, unsigned char* r, unsigned 
 	
 	// find frequency of palette colors in block
 	for (int i = 0; i < 256; i++) {
-		unsigned int best_distance = ~0;
-		int best_color = -1;
-		
-		for (int c = 0; c < 256; c++) {
-			unsigned int dist = color_dist(palette->colors[c], r[i], g[i], b[i]);
-			
-			if (dist < best_distance) {
-				best_distance = dist;
-				best_color = c;
-			}
-		}
-		
-		color_stats[best_color]++;
+		unsigned short key = donk_color_to_key(r[i], g[i], b[i]);
+		color_stats[palette->palette_lut[key]]++;
 	}
 	
 	// find 16 most frequent palette colors
@@ -181,7 +198,7 @@ void donk_palette_add_block(donk_palette_t* palette, unsigned char* r, unsigned 
 		short commonest = -1;
 		int commonestc = 0;
 		
-		for (unsigned char j = 0; j < 256; j++) {
+		for (short j = 0; j < 256; j++) {
 			if (color_stats[j] > commonestc) {
 				commonestc = color_stats[j];
 				commonest = j;
@@ -191,7 +208,7 @@ void donk_palette_add_block(donk_palette_t* palette, unsigned char* r, unsigned 
 		colors[i] = commonest;
 		if (commonest > 0) color_stats[commonest] = 0;
 	}
-	
+
 	donk_array_append(&palette->subpalette_stats, colors);
 }
 
@@ -242,13 +259,17 @@ void donk_palette_build_subpalettes(donk_palette_t* palette) {
 				int least_frequent = 0;
 				int least_frequency = INT_MAX;
 				for (int i = 0; i < 256; i++) {
-					if (subpalettes[s].frequency[i] > 0) colors_represented++;
+					if (subpalettes[s].frequency[i] > 0) {
+						colors_represented++;
+					} else {
+						continue;
+					}
 					if (subpalettes[s].frequency[i] < least_frequency) {
 						least_frequency = subpalettes[s].frequency[i];
 						least_frequent = i;
 					}
 				}
-				
+	
 				if (colors_represented <= 16) break;
 				
 				subpalettes[s].frequency[least_frequent] = 0;
@@ -262,13 +283,13 @@ void donk_palette_build_subpalettes(donk_palette_t* palette) {
 			}
 		}
 	}
-	
+
 	palette->subpalettes = malloc(32 * 16);
 	for (int s = 0; s < 32; s++) {
 		unsigned char colors[16];
 		memset(colors, 0, 16);
 		int last_color = 0;
-		for (unsigned char i = 0; i < 256; i++) {
+		for (int i = 0; i < 256; i++) {
 			if (subpalettes[s].colors[i]) {
 				colors[last_color++] = i;
 			}
@@ -277,21 +298,43 @@ void donk_palette_build_subpalettes(donk_palette_t* palette) {
 			palette->subpalettes[s * 16 + i] = colors[i];
 		}
 	}
+	
+	palette->subpalette_lut = malloc(32 * 65536);
+	for (int s = 0; s < 32; s++) {
+		for (int c = 0; c < 65536; c++) {
+			int best_color = 0;
+			int best_distance = INT_MAX;
+			
+			const int r = donk_key_to_r(c);
+			const int g = donk_key_to_g(c);
+			const int b = donk_key_to_b(c);
+			
+			for (int sc = 0; sc < 16; sc++) {
+				int this_color = palette->subpalettes[s * 16 + sc];
+				int this_dist = color_dist(palette->colors[this_color], r, g, b);
+				if (this_dist < best_distance) {
+					 best_distance = this_dist;
+					 best_color = sc;
+				}
+			}
+			
+			palette->subpalette_lut[s * 65536 + c] = best_color;
+		}
+	}
 }
 
 int donk_palette_best_subpalette(donk_palette_t* palette, unsigned char* r, unsigned char* g, unsigned char* b) {
 	int best_palette = 0;
 	int best_distance = INT_MAX;
+	
 	for (int s = 0; s < 32; s++) {
 		int distance = 0;
 		
 		for (int i = 0; i < 256; i++) {
-			int lowest_dist = INT_MAX;
-			for (int c = 0; c < 16; c++) {
-				int this_dist = color_dist(palette->colors[palette->subpalettes[s * 16 + c]], r[i], g[i], b[i]);
-				if (this_dist < lowest_dist) lowest_dist = this_dist;
-			}
-			distance += lowest_dist;
+			unsigned short key = donk_color_to_key(r[i], g[i], b[i]);
+			unsigned short color = palette->colors[palette->subpalettes[s * 16 + palette->subpalette_lut[s * 65536 + key]]];
+			
+			distance += color_dist(color, r[i], g[i], b[i]);
 		}
 		
 		if (distance < best_distance) {
@@ -305,15 +348,17 @@ int donk_palette_best_subpalette(donk_palette_t* palette, unsigned char* r, unsi
 
 void donk_palette_subpalettize(donk_palette_t* palette, int subpalette, unsigned char* r, unsigned char* g, unsigned char* b, unsigned char* res) {
 	for (int i = 0; i < 256; i++) {
-		int best_color = 0;
-		int best_distance = INT_MAX;
-		for (int c = 0; c < 16; c++) {
-			int distance = color_dist(palette->colors[palette->subpalettes[subpalette * 16 + c]], r[i], g[i], b[i]);
-			if (distance < best_distance) {
-				best_distance = distance;
-				best_color = c;
-			}
-		}
-		res[i] = best_color;
+		unsigned short key = donk_color_to_key(r[i], g[i], b[i]);
+		res[i] = palette->subpalette_lut[subpalette * 65536 + key];
+	}
+}
+
+void donk_palette_desubpalettize(donk_palette_t* palette, int subpalette, unsigned char* r, unsigned char* g, unsigned char* b, unsigned char* res) {
+	for (int i = 0; i < 256; i++) {
+		unsigned short key = palette->colors[palette->subpalettes[subpalette * 16 + res[i]]];
+		
+		r[i] = donk_key_to_r(key);
+		g[i] = donk_key_to_g(key);
+		b[i] = donk_key_to_b(key);
 	}
 }
