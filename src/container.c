@@ -35,6 +35,8 @@ struct channel_data {
 			// - copy of last frame
 			// 
 			
+			donk_palette_t* palette;
+			
 		} image;
 		struct {
 			
@@ -52,6 +54,12 @@ struct channel_header {
 	int channel_index;
 };
 
+struct palette_header {
+	int channel;
+	unsigned short colors[256];
+	unsigned char subpalettes[512];
+};
+
 struct image_wavelet_header {
 	int timestamp;
 	int channel;
@@ -64,11 +72,17 @@ struct image_wavelet_header {
 };
 
 struct delta_wavelet_header {
-	
+
 };
 
 struct image_palette_header {
+	int timestamp;
+	int channel;
 	
+	short width;
+	short height;
+	int size;
+	int actual_size;
 };
 
 struct delta_palette_header {
@@ -95,7 +109,6 @@ void donk_add_channel(donk_encoder_t* encoder, int flags, int index) {
 	channel.channel_flags = flags;
 	channel.channel_index = index;
 	donk_array_append(&encoder->channels, &channel);
-	
 
 	struct channel_header header;
 	memset(&header, 0, sizeof(header));
@@ -229,45 +242,138 @@ static void encode_wavelet_block(donk_stream_output_t* stream,
 	donk_write_bytes(stream, chroma_bytes, quantized_cb);
 }
 
-void donk_encode_frame(donk_encoder_t* encoder, donk_frame_t* frame) {
-	// TODO: lookup channel info here
-
+static void encode_palette_block(donk_stream_output_t* stream,
+	donk_palette_t* palette, unsigned char* r, unsigned char* g, unsigned char* b)
+{
+	unsigned char subpalette = donk_palette_best_subpalette(palette, r, g, b);
 	
-	int horizontal_blocks = (frame->image.width + 15) & ~15;
-	int vertical_blocks = (frame->image.height + 15) & ~15;
-	int wavelet_data_max = horizontal_blocks * vertical_blocks * (3 + 3 * 256);
+	unsigned char palettized_result[256];
+	donk_palette_subpalettize(palette, subpalette, r, g, b, palettized_result);
 	
-	unsigned char* encoded_wavelet_data = malloc(wavelet_data_max);
-	
-	donk_stream_output_t encode_stream;
-	donk_open_output_stream_in_memory(&encode_stream, encoded_wavelet_data, wavelet_data_max);
-	
-	for (int h = 0; h < frame->image.height; h += 16)
-	for (int w = 0; w < frame->image.width; w += 16) {
-		unsigned char r[256];
-		unsigned char g[256];
-		unsigned char b[256];
-		
-		deinterlace_coding_block(frame, w, h, r, g, b);
-		
-		encode_wavelet_block(&encode_stream, r, g, b);
+	unsigned char packed_result[128];
+	for (int i = 0; i < 128; i++) {
+		packed_result[i] = (palettized_result[i * 2] << 4) | palettized_result[i * 2 + 1];
 	}
 	
-	struct image_wavelet_header header;
-	memset(&header, 0, sizeof(header));
-	header.timestamp = frame->timestamp;
-	header.channel = frame->channel;
-	header.width = frame->image.width;
-	header.height = frame->image.height;
-	header.size = encode_stream.cursor;
-	header.actual_size = encode_stream.cursor;
-	donk_write_bytes(encoder->stream, 8, "DONKIMWV");
-	donk_write_bytes(encoder->stream, sizeof(header), &header);
-	
-	donk_write_bytes(encoder->stream, encode_stream.cursor, encoded_wavelet_data);
+	donk_write_bytes(stream, 1, &subpalette);
+	donk_write_bytes(stream, 128, packed_result);
 }
 
+void donk_encode_frame(donk_encoder_t* encoder, donk_frame_t* frame) {
+	struct channel_data* channel = NULL;
+	donk_array_for_each(&encoder->channels, candidate, struct channel_data) {
+		if (candidate->channel_index == frame->channel) {
+			channel = candidate;
+			break;
+		}
+	}
+	
+	if (!channel) abort();
+	
+	if (channel->channel_flags & (DONK_CHANNEL_IMAGE | DONK_CHANNEL_USE_PALETTE)) {
+		int horizontal_blocks = (frame->image.width + 15) & ~15;
+		int vertical_blocks = (frame->image.height + 15) & ~15;
+		int palette_data_size = horizontal_blocks * vertical_blocks * (1 + 256);
+		
+		unsigned char* encoded_palette_data = malloc(palette_data_size);
+		
+		donk_stream_output_t encode_stream;
+		donk_open_output_stream_in_memory(&encode_stream, encoded_palette_data, palette_data_size);
+		
+		for (int h = 0; h < frame->image.height; h += 16)
+		for (int w = 0; w < frame->image.width; w += 16) {
+			unsigned char r[256];
+			unsigned char g[256];
+			unsigned char b[256];
+			
+			deinterlace_coding_block(frame, w, h, r, g, b);
+			
+			encode_palette_block(&encode_stream, channel->image.palette, r, g, b);
+		}
+		
+		// * here we would encode a delta frame *
+		
+		struct image_palette_header header;
+		memset(&header, 0, sizeof(header));
+		header.timestamp = frame->timestamp;
+		header.channel = frame->channel;
+		header.width = frame->image.width;
+		header.height = frame->image.height;
+		header.size = encode_stream.cursor;
+		header.actual_size = encode_stream.cursor;
+		donk_write_bytes(encoder->stream, 8, "DONKIMPT");
+		donk_write_bytes(encoder->stream, sizeof(header), &header);
+		
+		donk_write_bytes(encoder->stream, encode_stream.cursor, encoded_palette_data);
+		
+		return;
+	}
+	
+	if (channel->channel_flags & DONK_CHANNEL_IMAGE) {
+		int horizontal_blocks = (frame->image.width + 15) & ~15;
+		int vertical_blocks = (frame->image.height + 15) & ~15;
+		int wavelet_data_max = horizontal_blocks * vertical_blocks * (3 + 3 * 256);
+		
+		unsigned char* encoded_wavelet_data = malloc(wavelet_data_max);
+		
+		donk_stream_output_t encode_stream;
+		donk_open_output_stream_in_memory(&encode_stream, encoded_wavelet_data, wavelet_data_max);
+		
+		for (int h = 0; h < frame->image.height; h += 16)
+		for (int w = 0; w < frame->image.width; w += 16) {
+			unsigned char r[256];
+			unsigned char g[256];
+			unsigned char b[256];
+			
+			deinterlace_coding_block(frame, w, h, r, g, b);
+			
+			encode_wavelet_block(&encode_stream, r, g, b);
+		}
+		
+		// * here we would encode a delta frame *
+		
+		struct image_wavelet_header header;
+		memset(&header, 0, sizeof(header));
+		header.timestamp = frame->timestamp;
+		header.channel = frame->channel;
+		header.width = frame->image.width;
+		header.height = frame->image.height;
+		header.size = encode_stream.cursor;
+		header.actual_size = encode_stream.cursor;
+		donk_write_bytes(encoder->stream, 8, "DONKIMWV");
+		donk_write_bytes(encoder->stream, sizeof(header), &header);
+		
+		donk_write_bytes(encoder->stream, encode_stream.cursor, encoded_wavelet_data);
+		
+		return;
+	}
+	
+	printf("o no couldent encode the frame!!!!\n");
+}
 
+void donk_add_palette(donk_encoder_t* encoder, donk_palette_t* palette, int channel_index) {
+	struct channel_data* channel = NULL;
+	donk_array_for_each(&encoder->channels, candidate, struct channel_data) {
+		if (candidate->channel_index == channel_index) {
+			channel = candidate;
+			break;
+		}
+	}
+	
+	if (!channel) abort();
+	
+	channel->image.palette = palette;
+	
+	struct palette_header header;
+	memset(&header, 0, sizeof(header));
+	header.channel = channel_index;
+	
+	memcpy(header.colors, palette->colors, 512);
+	memcpy(header.subpalettes, palette->subpalettes, 512);
+	
+	donk_write_bytes(encoder->stream, 8, "DONKPLTE");
+	donk_write_bytes(encoder->stream, sizeof(header), &header);
+}
 
 void donk_create_decoder(donk_decoder_t* decoder, donk_stream_input_t* input) {
 	memset(decoder, 0, sizeof(decoder));
@@ -296,6 +402,32 @@ static void decode_channel_info(donk_decoder_t* decoder, donk_frame_t* frame) {
 	channel.channel_flags = header.channel_flags;
 	channel.channel_index = header.channel_index;
 	donk_array_append(&decoder->channels, &channel);
+}
+
+static void decode_palette_info(donk_decoder_t* decoder, donk_frame_t* frame) {
+	struct palette_header header;
+	donk_read_bytes(decoder->stream, sizeof(header), &header);
+	
+	printf("found palete for %i \n", header.channel);
+
+	donk_palette_t* palette = malloc(sizeof(donk_palette_t));
+	donk_palette_make(palette);
+	
+	palette->colors = malloc(512);
+	palette->subpalettes = malloc(512);
+	
+	memcpy(palette->colors, header.colors, 512);
+	memcpy(palette->subpalettes, header.subpalettes, 512);
+	
+	struct channel_data* channel = NULL;
+	donk_array_for_each(&decoder->channels, candidate, struct channel_data) {
+		if (candidate->channel_index == header.channel) {
+			channel = candidate;
+			break;
+		}
+	}
+	
+	channel->image.palette = palette;
 }
 
 static void decode_wavelet_image(donk_decoder_t* decoder, donk_frame_t* frame) {
@@ -415,6 +547,60 @@ static void decode_wavelet_image(donk_decoder_t* decoder, donk_frame_t* frame) {
 	printf("done decoding image\n");
 }
 
+static void decode_palette_image(donk_decoder_t* decoder, donk_frame_t* frame) {
+	struct image_palette_header header;
+	donk_read_bytes(decoder->stream, sizeof(header), &header);
+	
+	printf("decoding palette image channel %i timestamp %i\n", header.channel, header.timestamp);
+	printf("image width %i height %i\n", header.width, header.height);
+	
+	struct channel_data* channel = NULL;
+	donk_array_for_each(&decoder->channels, candidate, struct channel_data) {
+		if (candidate->channel_index == header.channel) {
+			channel = candidate;
+			break;
+		}
+	}
+	
+	if (!channel) abort();
+	
+	donk_frame_image_make(frame, header.width, header.height); 
+	frame->timestamp = header.timestamp;
+	frame->channel = header.channel;
+	frame->image.width = header.width;
+	frame->image.height = header.height;
+	
+	
+	int horizontal_blocks = (header.width >> 4) << 4 == header.width 
+		? header.width : ((header.width >> 4) + 1) << 4;
+	int vertical_blocks = (header.height >> 4) << 4 == header.height 
+		? header.height : ((header.height >> 4) + 1) << 4;
+	for (int h = 0; h < vertical_blocks; h += 16)
+	for (int w = 0; w < horizontal_blocks; w += 16) {
+		unsigned char palettized_block[256];
+		unsigned char packed_block[128];
+		unsigned char palette;
+		
+		donk_read_bytes(decoder->stream, 1, &palette);
+		donk_read_bytes(decoder->stream, 128, packed_block);
+		
+		for (int i = 0; i < 128; i++) {
+			palettized_block[i * 2] = packed_block[i] >> 4;
+			palettized_block[i * 2 + 1] = packed_block[i] & 0x0F;
+		}
+		
+		unsigned char r[256];
+		unsigned char g[256];
+		unsigned char b[256];
+		
+		donk_palette_desubpalettize(channel->image.palette, palette, r, g, b, palettized_block);
+		
+		interlace_coding_block(frame, w, h, r, g, b);
+	}
+	
+	printf("done decoding image\n");
+}
+
 void donk_decode_frame(donk_decoder_t* decoder, donk_frame_t* frame) {
 	int sync;
 	donk_read_bytes(decoder->stream, 4, &sync);
@@ -431,12 +617,18 @@ void donk_decode_frame(donk_decoder_t* decoder, donk_frame_t* frame) {
 			donk_decode_frame(decoder, frame);
 			return;
 		case pack_code('C', 'H', 'A', 'N'):
-			decode_file_info(decoder, frame);
+			decode_channel_info(decoder, frame);
+			donk_decode_frame(decoder, frame);
+			return;
+		case pack_code('P', 'L', 'T', 'E'):
+			decode_palette_info(decoder, frame);
 			donk_decode_frame(decoder, frame);
 			return;
 		
 		case pack_code('I', 'M', 'W', 'V'):
 			decode_wavelet_image(decoder, frame); return;
+		case pack_code('I', 'M', 'P', 'T'):
+			decode_palette_image(decoder, frame); return;
 		default:
 			printf("frame code '%c%c%c%c' invalid\n", code & 0xFF,
 				(code >> 8) & 0xFF, (code >> 16) & 0xFF, (code >> 24) & 0xFF);

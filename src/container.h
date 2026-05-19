@@ -37,6 +37,7 @@ enum {
 void donk_create_encoder(donk_encoder_t* encoder, donk_stream_output_t* output, int mode);
 void donk_add_channel(donk_encoder_t* encoder, int flags, int index);
 void donk_encode_frame(donk_encoder_t* encoder, donk_frame_t* frame);
+void donk_add_palette(donk_encoder_t* encoder, donk_palette_t* palette, int channel_index);
 
 void donk_create_decoder(donk_decoder_t* decoder, donk_stream_input_t* input);
 void donk_decode_frame(donk_decoder_t* decoder, donk_frame_t* frame);
